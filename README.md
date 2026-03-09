@@ -70,7 +70,7 @@ crontab -e
 Add the following line (adjust the path to match your project directory):
 
 ```
-0 * * * * /path/to/proj1/venv/bin/python /path/to/proj1/twitter_monitor.py >> /path/to/proj1/monitor.log 2>&1
+0 * * * * /path/to/twitter-fetcher/venv/bin/python /path/to/twitter-fetcher/twitter_monitor.py >> /path/to/twitter-fetcher/monitor.log 2>&1
 ```
 
 ## Files
