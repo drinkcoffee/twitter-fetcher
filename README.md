@@ -21,7 +21,15 @@ Monitors a list of X (Twitter) accounts for new tweets using [Nitter](https://gi
    pip install -r requirements.txt
    ```
 
-3. **Configure accounts to monitor:**
+3. **Set your Anthropic API key:**
+
+   The script uses the Claude API to summarize new tweets. Export your key before running:
+
+   ```bash
+   export ANTHROPIC_API_KEY=your_key_here
+   ```
+
+4. **Configure accounts to monitor:**
 
    Edit `accounts.json` with a JSON array of Twitter usernames:
 
@@ -48,6 +56,7 @@ venv/bin/python twitter_monitor.py
 - **First run:** fetches up to the 20 most recent tweets per account and saves them as a baseline. No output is shown for these since they are treated as already seen.
 - **Subsequent runs:** only tweets posted since the last run are shown.
 - Progress is printed as each account is checked, followed by a full summary at the end.
+- For any account with new tweets, the Claude API (`claude-opus-4-6`) generates a concise 2-3 sentence AI summary of what that account has been saying.
 - Results and state are saved to `tweet_store.json` between runs.
 
 ## Automating with cron
@@ -72,3 +81,4 @@ Add the following line (adjust the path to match your project directory):
 | `accounts.json` | List of Twitter usernames to monitor |
 | `tweet_store.json` | Auto-generated state file — tracks last seen tweet per account |
 | `requirements.txt` | Python dependencies |
+| `xapi_variant/` | Alternative implementation using the official X/Twitter API |
