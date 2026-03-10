@@ -8,11 +8,13 @@ stores them locally, and prints a summary of new tweets since the last run.
 
 import json
 import os
+import random
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import anthropic
+import ollama
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.firefox.options import Options
@@ -83,7 +85,7 @@ def load_accounts() -> list[str]:
 def pick_instance(driver: WebDriver) -> str | None:
     """Return the first Nitter instance that responds with real content."""
     print(f"[DEBUG] pick_instance() called, trying {len(NITTER_INSTANCES)} instances")
-    for base in NITTER_INSTANCES:
+    for base in random.sample(NITTER_INSTANCES, len(NITTER_INSTANCES)):
         try:
             print(f"[DEBUG] pick_instance() trying {base}")
             driver.get(base)
@@ -200,28 +202,51 @@ def fetch_tweets(
 # AI summarization
 # ---------------------------------------------------------------------------
 
+SYSTEM_PROMPT = "You summarize tweets concisely. Be direct and factual. 2-3 sentences max."
+
+
 def summarize_tweets(username: str, tweets: list[dict]) -> str:
     """Return a concise AI-generated summary of what an account has been saying."""
     print(f"[DEBUG] summarize_tweets(username='{username}', tweets={len(tweets)} items)")
     tweet_text = "\n".join(
         f"- [{fmt_time(t['created_at'])}] {t['text']}" for t in tweets
     )
+    user_prompt = (
+        f"Summarize what @{username} has been saying based on these recent tweets:\n\n"
+        f"{tweet_text}"
+    )
+
+    provider = os.environ.get("LLM_PROVIDER", "ollama").lower()
+    if provider == "anthropic":
+        result = _summarize_anthropic(user_prompt)
+    else:
+        result = _summarize_ollama(user_prompt)
+
+    print(f"[DEBUG] summarize_tweets() -> '{result[:100]}{'...' if len(result) > 100 else ''}'")
+    return result
+
+
+def _summarize_anthropic(user_prompt: str) -> str:
     client = anthropic.Anthropic()
     with client.messages.stream(
         model="claude-opus-4-6",
         max_tokens=256,
-        system="You summarize tweets concisely. Be direct and factual. 2-3 sentences max.",
-        messages=[{
-            "role": "user",
-            "content": (
-                f"Summarize what @{username} has been saying based on these recent tweets:\n\n"
-                f"{tweet_text}"
-            ),
-        }],
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_prompt}],
     ) as stream:
-        result = stream.get_final_message().content[0].text
-    print(f"[DEBUG] summarize_tweets() -> '{result[:100]}{'...' if len(result) > 100 else ''}'")
-    return result
+        return stream.get_final_message().content[0].text
+
+
+def _summarize_ollama(user_prompt: str) -> str:
+    model = os.environ.get("OLLAMA_MODEL", "llama3.2")
+    response = ollama.chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    return response.message.content
 
 
 # ---------------------------------------------------------------------------
@@ -255,8 +280,10 @@ def fmt_tweet(tweet: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    provider = os.environ.get("LLM_PROVIDER", "ollama").lower()
+    if provider == "anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
         raise SystemExit("Error: ANTHROPIC_API_KEY environment variable is not set.")
+    print(f"Using LLM provider: {provider}" + (f" (model: {os.environ.get('OLLAMA_MODEL', 'llama3.2')})" if provider == "ollama" else ""))
 
     accounts = load_accounts()
     store = load_store()
@@ -264,6 +291,16 @@ def main() -> None:
 
     last_run: str | None = store.get("last_run")
     is_first_run = last_run is None
+
+    if last_run is not None:
+        last_run_dt = datetime.fromisoformat(last_run)
+        now = datetime.now(timezone.utc)
+        if (now - last_run_dt).total_seconds() < 3600:
+            print("Last run was less than an hour ago — treating as if last run was one day ago.")
+            last_run = (now - timedelta(days=1)).isoformat()
+            # Clear per-account since_id so tweets from the past day are fetched
+            for key in store.get("accounts", {}):
+                store["accounts"][key].pop("last_tweet_id", None)
 
     options = Options()
     options.add_argument('-headless')
