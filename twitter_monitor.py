@@ -7,13 +7,16 @@ stores them locally, and prints a summary of new tweets since the last run.
 """
 
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import anthropic
-import requests
 from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.remote.webdriver import WebDriver
 
 STORE_FILE = Path("tweet_store.json")
 ACCOUNTS_FILE = Path("accounts.json")
@@ -21,15 +24,12 @@ MAX_RESULTS_FIRST_RUN = 20
 
 # Try instances in order; first one that responds wins
 NITTER_INSTANCES = [
-    "https://nitter.net",
     "https://nitter.poast.org",
     "https://nitter.privacydev.net",
     "https://nitter.cz",
+    "https://nitter.net",
 ]
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; twitter-monitor/2.0)"
-}
 
 
 # ---------------------------------------------------------------------------
@@ -37,16 +37,22 @@ HEADERS = {
 # ---------------------------------------------------------------------------
 
 def load_store() -> dict:
+    print(f"[DEBUG] load_store() called")
     if STORE_FILE.exists():
         with open(STORE_FILE) as f:
-            return json.load(f)
-    return {"accounts": {}, "last_run": None}
+            result = json.load(f)
+    else:
+        result = {"accounts": {}, "last_run": None}
+    print(f"[DEBUG] load_store() -> accounts={list(result.get('accounts', {}).keys())}, last_run={result.get('last_run')}")
+    return result
 
 
 def save_store(store: dict) -> None:
+    print(f"[DEBUG] save_store() called with accounts={list(store.get('accounts', {}).keys())}")
     store["last_run"] = datetime.now(timezone.utc).isoformat()
     with open(STORE_FILE, "w") as f:
         json.dump(store, f, indent=2)
+    print(f"[DEBUG] save_store() -> wrote to {STORE_FILE}, last_run={store['last_run']}")
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +60,7 @@ def save_store(store: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def load_accounts() -> list[str]:
+    print(f"[DEBUG] load_accounts() called")
     if not ACCOUNTS_FILE.exists():
         raise SystemExit(
             f"Error: {ACCOUNTS_FILE} not found.\n"
@@ -64,34 +71,45 @@ def load_accounts() -> list[str]:
         accounts = json.load(f)
     if not isinstance(accounts, list) or not accounts:
         raise SystemExit("Error: accounts.json must be a non-empty JSON array of usernames.")
-    return [a.lstrip("@") for a in accounts]
+    result = [a.lstrip("@") for a in accounts]
+    print(f"[DEBUG] load_accounts() -> {result}")
+    return result
 
 
 # ---------------------------------------------------------------------------
 # Nitter scraping
 # ---------------------------------------------------------------------------
 
-def pick_instance() -> str | None:
-    """Return the first Nitter instance that responds."""
+def pick_instance(driver: WebDriver) -> str | None:
+    """Return the first Nitter instance that responds with real content."""
+    print(f"[DEBUG] pick_instance() called, trying {len(NITTER_INSTANCES)} instances")
     for base in NITTER_INSTANCES:
         try:
-            r = requests.get(base, headers=HEADERS, timeout=8)
-            if r.status_code == 200:
+            print(f"[DEBUG] pick_instance() trying {base}")
+            driver.get(base)
+            html = driver.page_source
+            if len(html) > 1000:
+                print(f"[DEBUG] pick_instance() -> {base} ({len(html)} bytes)")
                 return base
-        except requests.RequestException:
-            continue
+            print(f"[DEBUG] pick_instance() {base} returned too little content ({len(html)} bytes), skipping")
+        except Exception as exc:
+            print(f"[DEBUG] pick_instance() {base} failed: {exc}")
+    print(f"[DEBUG] pick_instance() -> None (no instances reachable)")
     return None
 
 
 def parse_tweet_id(tweet_link: str) -> str | None:
     """Extract numeric tweet ID from a path like /username/status/12345."""
+    print(f"[DEBUG] parse_tweet_id('{tweet_link}')")
     parts = tweet_link.rstrip("/").split("/")
     if "status" in parts:
         idx = parts.index("status")
         if idx + 1 < len(parts):
             candidate = parts[idx + 1].split("#")[0]
             if candidate.isdigit():
+                print(f"[DEBUG] parse_tweet_id() -> '{candidate}'")
                 return candidate
+    print(f"[DEBUG] parse_tweet_id() -> None")
     return None
 
 
@@ -100,15 +118,20 @@ def parse_nitter_date(title: str) -> str:
     Nitter title attribute format: 'Mar 9, 2026 · 3:45 PM UTC'
     Returns ISO format string or the raw title if parsing fails.
     """
+    print(f"[DEBUG] parse_nitter_date('{title}')")
     try:
         clean = title.replace(" · ", " ").replace(" UTC", "")
         dt = datetime.strptime(clean, "%b %d, %Y %I:%M %p")
-        return dt.replace(tzinfo=timezone.utc).isoformat()
+        result = dt.replace(tzinfo=timezone.utc).isoformat()
+        print(f"[DEBUG] parse_nitter_date() -> '{result}'")
+        return result
     except ValueError:
+        print(f"[DEBUG] parse_nitter_date() -> '{title}' (parse failed, returning raw)")
         return title
 
 
 def fetch_tweets(
+    driver: WebDriver,
     base_url: str,
     username: str,
     since_id: str | None,
@@ -118,17 +141,22 @@ def fetch_tweets(
     Scrape Nitter for tweets from `username`.
     Returns (tweets, error_message). tweets is sorted oldest-first.
     """
+    print(f"[DEBUG] fetch_tweets(base_url='{base_url}', username='{username}', since_id={since_id}, is_first_run={is_first_run})")
     url = f"{base_url}/{username}"
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        if resp.status_code == 404:
-            return [], "user not found"
-        if resp.status_code != 200:
-            return [], f"HTTP {resp.status_code}"
-    except requests.RequestException as exc:
+        driver.get(url)
+        html = driver.page_source
+        print(f"[DEBUG] fetch_tweets html length: {len(html)} for {url}")
+        if len(html) < 1000:
+            return [], f"unexpected empty response ({len(html)} bytes)"
+    except Exception as exc:
+        print(f"[DEBUG] fetch_tweets() -> ([], '{exc}')")
         return [], str(exc)
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    soup = BeautifulSoup(html, "html.parser")
+    # Check for 404-style "user not found" page
+    if soup.select_one(".error-panel"):
+        return [], "user not found"
     items = soup.select(".timeline-item")
 
     tweets = []
@@ -164,6 +192,7 @@ def fetch_tweets(
     if is_first_run:
         tweets = tweets[-MAX_RESULTS_FIRST_RUN:]
 
+    print(f"[DEBUG] fetch_tweets() -> ({len(tweets)} tweets, None) ids={[t['id'] for t in tweets]}")
     return tweets, None
 
 
@@ -173,6 +202,7 @@ def fetch_tweets(
 
 def summarize_tweets(username: str, tweets: list[dict]) -> str:
     """Return a concise AI-generated summary of what an account has been saying."""
+    print(f"[DEBUG] summarize_tweets(username='{username}', tweets={len(tweets)} items)")
     tweet_text = "\n".join(
         f"- [{fmt_time(t['created_at'])}] {t['text']}" for t in tweets
     )
@@ -189,7 +219,9 @@ def summarize_tweets(username: str, tweets: list[dict]) -> str:
             ),
         }],
     ) as stream:
-        return stream.get_final_message().content[0].text
+        result = stream.get_final_message().content[0].text
+    print(f"[DEBUG] summarize_tweets() -> '{result[:100]}{'...' if len(result) > 100 else ''}'")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -197,17 +229,25 @@ def summarize_tweets(username: str, tweets: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 def fmt_time(iso: str) -> str:
+    print(f"[DEBUG] fmt_time('{iso}')")
     if not iso:
+        print(f"[DEBUG] fmt_time() -> 'unknown time'")
         return "unknown time"
     try:
         dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d %H:%M UTC")
+        result = dt.strftime("%Y-%m-%d %H:%M UTC")
+        print(f"[DEBUG] fmt_time() -> '{result}'")
+        return result
     except ValueError:
+        print(f"[DEBUG] fmt_time() -> '{iso}' (parse failed, returning raw)")
         return iso
 
 
 def fmt_tweet(tweet: dict) -> str:
-    return f"  [{fmt_time(tweet['created_at'])}] {tweet['text']}"
+    print(f"[DEBUG] fmt_tweet(id={tweet.get('id')}, text='{tweet.get('text', '')[:50]}...')")
+    result = f"  [{fmt_time(tweet['created_at'])}] {tweet['text']}"
+    print(f"[DEBUG] fmt_tweet() -> '{result[:80]}{'...' if len(result) > 80 else ''}'")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +255,9 @@ def fmt_tweet(tweet: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        raise SystemExit("Error: ANTHROPIC_API_KEY environment variable is not set.")
+
     accounts = load_accounts()
     store = load_store()
     store.setdefault("accounts", {})
@@ -222,8 +265,18 @@ def main() -> None:
     last_run: str | None = store.get("last_run")
     is_first_run = last_run is None
 
+    options = Options()
+    options.add_argument('-headless')
+    driver = webdriver.Firefox(options=options)
+    try:
+        _run(accounts, store, last_run, is_first_run, driver)
+    finally:
+        driver.quit()
+
+
+def _run(accounts, store, last_run, is_first_run, driver: WebDriver) -> None:
     print("Connecting to a Nitter instance...")
-    base_url = pick_instance()
+    base_url = pick_instance(driver)
     if not base_url:
         raise SystemExit("Error: No Nitter instances are reachable. Try again later.")
     print(f"Using: {base_url}\n")
@@ -255,7 +308,7 @@ def main() -> None:
         account_data = store["accounts"].get(key, {})
         since_id = None if is_first_run else account_data.get("last_tweet_id")
 
-        tweets, error = fetch_tweets(base_url, username, since_id, is_first_run)
+        tweets, error = fetch_tweets(driver, base_url, username, since_id, is_first_run)
 
         if error:
             print(f"error: {error}")

@@ -5,6 +5,7 @@ Monitors a list of X (Twitter) accounts for new tweets using [Nitter](https://gi
 ## Requirements
 
 - Python 3.10+
+- FireFox web browser
 
 ## Setup
 
