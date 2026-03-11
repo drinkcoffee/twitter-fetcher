@@ -39,22 +39,18 @@ NITTER_INSTANCES = [
 # ---------------------------------------------------------------------------
 
 def load_store() -> dict:
-    print(f"[DEBUG] load_store() called")
     if STORE_FILE.exists():
         with open(STORE_FILE) as f:
             result = json.load(f)
     else:
         result = {"accounts": {}, "last_run": None}
-    print(f"[DEBUG] load_store() -> accounts={list(result.get('accounts', {}).keys())}, last_run={result.get('last_run')}")
     return result
 
 
 def save_store(store: dict) -> None:
-    print(f"[DEBUG] save_store() called with accounts={list(store.get('accounts', {}).keys())}")
     store["last_run"] = datetime.now(timezone.utc).isoformat()
     with open(STORE_FILE, "w") as f:
         json.dump(store, f, indent=2)
-    print(f"[DEBUG] save_store() -> wrote to {STORE_FILE}, last_run={store['last_run']}")
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +58,6 @@ def save_store(store: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def load_accounts() -> list[str]:
-    print(f"[DEBUG] load_accounts() called")
     if not ACCOUNTS_FILE.exists():
         raise SystemExit(
             f"Error: {ACCOUNTS_FILE} not found.\n"
@@ -74,7 +69,7 @@ def load_accounts() -> list[str]:
     if not isinstance(accounts, list) or not accounts:
         raise SystemExit("Error: accounts.json must be a non-empty JSON array of usernames.")
     result = [a.lstrip("@") for a in accounts]
-    print(f"[DEBUG] load_accounts() -> {result}")
+    print(f"Checking accounts -> {result}")
     return result
 
 
@@ -84,19 +79,19 @@ def load_accounts() -> list[str]:
 
 def pick_instance(driver: WebDriver) -> str | None:
     """Return the first Nitter instance that responds with real content."""
-    print(f"[DEBUG] pick_instance() called, trying {len(NITTER_INSTANCES)} instances")
+    print(f"Trying {len(NITTER_INSTANCES)} Nitter instances")
     for base in random.sample(NITTER_INSTANCES, len(NITTER_INSTANCES)):
         try:
-            print(f"[DEBUG] pick_instance() trying {base}")
+            print(f" Trying {base}")
             driver.get(base)
             html = driver.page_source
             if len(html) > 1000:
-                print(f"[DEBUG] pick_instance() -> {base} ({len(html)} bytes)")
+                # print(f"[DEBUG] pick_instance() -> {base} ({len(html)} bytes)")
                 return base
-            print(f"[DEBUG] pick_instance() {base} returned too little content ({len(html)} bytes), skipping")
+            print(f" {base} returned too little content ({len(html)} bytes), skipping")
         except Exception as exc:
-            print(f"[DEBUG] pick_instance() {base} failed: {exc}")
-    print(f"[DEBUG] pick_instance() -> None (no instances reachable)")
+            print(f" {base} failed: {exc}")
+    print(f"No Nitter instances reachable)")
     return None
 
 
@@ -143,12 +138,10 @@ def fetch_tweets(
     Scrape Nitter for tweets from `username`.
     Returns (tweets, error_message). tweets is sorted oldest-first.
     """
-    print(f"[DEBUG] fetch_tweets(base_url='{base_url}', username='{username}', since_id={since_id}, is_first_run={is_first_run})")
     url = f"{base_url}/{username}"
     try:
         driver.get(url)
         html = driver.page_source
-        #print(f"[DEBUG] fetch_tweets html length: {len(html)} for {url}")
         if len(html) < 1000:
             return [], f"unexpected empty response ({len(html)} bytes)"
     except Exception as exc:
@@ -194,7 +187,6 @@ def fetch_tweets(
     if is_first_run:
         tweets = tweets[-MAX_RESULTS_FIRST_RUN:]
 
-    #print(f"[DEBUG] fetch_tweets() -> ({len(tweets)} tweets, None) ids={[t['id'] for t in tweets]}")
     return tweets, None
 
 
@@ -353,7 +345,7 @@ def _run(accounts, store, last_run, is_first_run, driver: WebDriver) -> None:
 
     total = len(accounts)
     for i, username in enumerate(accounts, 1):
-        print(f"  [{i}/{total}] Checking @{username}...", end=" ", flush=True)
+        print(f"[{i}/{total}] Checking @{username}...", end=" ", flush=True)
 
         key = username.lower()
         account_data = store["accounts"].get(key, {})
@@ -391,8 +383,8 @@ def _run(accounts, store, last_run, is_first_run, driver: WebDriver) -> None:
         for username, tweets in with_new:
             count = len(tweets)
             print(f"@{username}  ({count} new tweet{'s' if count != 1 else ''})")
-            # for tweet in tweets:
-            #     print(fmt_tweet(tweet))
+            for tweet in tweets:
+                print(f"  {fmt_time(tweet['created_at'])}")
             summary = summarize_tweets(username, tweets)
             account_summaries.append((username, summary))
             print(f"\n  Summary: {summary}")
