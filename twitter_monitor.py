@@ -102,16 +102,16 @@ def pick_instance(driver: WebDriver) -> str | None:
 
 def parse_tweet_id(tweet_link: str) -> str | None:
     """Extract numeric tweet ID from a path like /username/status/12345."""
-    print(f"[DEBUG] parse_tweet_id('{tweet_link}')")
+    #print(f"[DEBUG] parse_tweet_id('{tweet_link}')")
     parts = tweet_link.rstrip("/").split("/")
     if "status" in parts:
         idx = parts.index("status")
         if idx + 1 < len(parts):
             candidate = parts[idx + 1].split("#")[0]
             if candidate.isdigit():
-                print(f"[DEBUG] parse_tweet_id() -> '{candidate}'")
+                #print(f"[DEBUG] parse_tweet_id() -> '{candidate}'")
                 return candidate
-    print(f"[DEBUG] parse_tweet_id() -> None")
+    #print(f"[DEBUG] parse_tweet_id() -> None")
     return None
 
 
@@ -120,12 +120,12 @@ def parse_nitter_date(title: str) -> str:
     Nitter title attribute format: 'Mar 9, 2026 · 3:45 PM UTC'
     Returns ISO format string or the raw title if parsing fails.
     """
-    print(f"[DEBUG] parse_nitter_date('{title}')")
+    #print(f"[DEBUG] parse_nitter_date('{title}')")
     try:
         clean = title.replace(" · ", " ").replace(" UTC", "")
         dt = datetime.strptime(clean, "%b %d, %Y %I:%M %p")
         result = dt.replace(tzinfo=timezone.utc).isoformat()
-        print(f"[DEBUG] parse_nitter_date() -> '{result}'")
+        #print(f"[DEBUG] parse_nitter_date() -> '{result}'")
         return result
     except ValueError:
         print(f"[DEBUG] parse_nitter_date() -> '{title}' (parse failed, returning raw)")
@@ -148,7 +148,7 @@ def fetch_tweets(
     try:
         driver.get(url)
         html = driver.page_source
-        print(f"[DEBUG] fetch_tweets html length: {len(html)} for {url}")
+        #print(f"[DEBUG] fetch_tweets html length: {len(html)} for {url}")
         if len(html) < 1000:
             return [], f"unexpected empty response ({len(html)} bytes)"
     except Exception as exc:
@@ -194,7 +194,7 @@ def fetch_tweets(
     if is_first_run:
         tweets = tweets[-MAX_RESULTS_FIRST_RUN:]
 
-    print(f"[DEBUG] fetch_tweets() -> ({len(tweets)} tweets, None) ids={[t['id'] for t in tweets]}")
+    #print(f"[DEBUG] fetch_tweets() -> ({len(tweets)} tweets, None) ids={[t['id'] for t in tweets]}")
     return tweets, None
 
 
@@ -207,7 +207,7 @@ SYSTEM_PROMPT = "You summarize tweets concisely. Be direct and factual. 2-3 sent
 
 def summarize_tweets(username: str, tweets: list[dict]) -> str:
     """Return a concise AI-generated summary of what an account has been saying."""
-    print(f"[DEBUG] summarize_tweets(username='{username}', tweets={len(tweets)} items)")
+    #print(f"[DEBUG] summarize_tweets(username='{username}', tweets={len(tweets)} items)")
     tweet_text = "\n".join(
         f"- [{fmt_time(t['created_at'])}] {t['text']}" for t in tweets
     )
@@ -222,7 +222,7 @@ def summarize_tweets(username: str, tweets: list[dict]) -> str:
     else:
         result = _summarize_ollama(user_prompt)
 
-    print(f"[DEBUG] summarize_tweets() -> '{result[:100]}{'...' if len(result) > 100 else ''}'")
+    #print(f"[DEBUG] summarize_tweets() -> '{result[:100]}{'...' if len(result) > 100 else ''}'")
     return result
 
 
@@ -249,19 +249,33 @@ def _summarize_ollama(user_prompt: str) -> str:
     return response.message.content
 
 
+def summarize_all(account_summaries: list[tuple[str, str]]) -> str:
+    """Return an overall summary across all account summaries."""
+    combined = "\n".join(f"@{username}: {summary}" for username, summary in account_summaries)
+    user_prompt = (
+        f"Below are summaries of what several accounts have been posting on X (Twitter).\n\n"
+        f"{combined}\n\n"
+        f"Write a brief overall summary of the key themes and topics being discussed."
+    )
+    provider = os.environ.get("LLM_PROVIDER", "ollama").lower()
+    if provider == "anthropic":
+        result = _summarize_anthropic(user_prompt)
+    else:
+        result = _summarize_ollama(user_prompt)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
 
 def fmt_time(iso: str) -> str:
-    print(f"[DEBUG] fmt_time('{iso}')")
     if not iso:
         print(f"[DEBUG] fmt_time() -> 'unknown time'")
         return "unknown time"
     try:
         dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
         result = dt.strftime("%Y-%m-%d %H:%M UTC")
-        print(f"[DEBUG] fmt_time() -> '{result}'")
         return result
     except ValueError:
         print(f"[DEBUG] fmt_time() -> '{iso}' (parse failed, returning raw)")
@@ -269,9 +283,9 @@ def fmt_time(iso: str) -> str:
 
 
 def fmt_tweet(tweet: dict) -> str:
-    print(f"[DEBUG] fmt_tweet(id={tweet.get('id')}, text='{tweet.get('text', '')[:50]}...')")
+    # print(f"[DEBUG] fmt_tweet(id={tweet.get('id')}, text='{tweet.get('text', '')[:50]}...')")
     result = f"  [{fmt_time(tweet['created_at'])}] {tweet['text']}"
-    print(f"[DEBUG] fmt_tweet() -> '{result[:80]}{'...' if len(result) > 80 else ''}'")
+    # print(f"[DEBUG] fmt_tweet() -> '{result[:80]}{'...' if len(result) > 80 else ''}'")
     return result
 
 
@@ -373,12 +387,22 @@ def _run(accounts, store, last_run, is_first_run, driver: WebDriver) -> None:
     if with_new:
         label = "Recent Tweets (first run)" if is_first_run else "New Tweets Since Last Run"
         print(f"\n{label}\n")
+        account_summaries: list[tuple[str, str]] = []
         for username, tweets in with_new:
             count = len(tweets)
             print(f"@{username}  ({count} new tweet{'s' if count != 1 else ''})")
-            for tweet in tweets:
-                print(fmt_tweet(tweet))
-            print(f"\n  Summary: {summarize_tweets(username, tweets)}")
+            # for tweet in tweets:
+            #     print(fmt_tweet(tweet))
+            summary = summarize_tweets(username, tweets)
+            account_summaries.append((username, summary))
+            print(f"\n  Summary: {summary}")
+            print()
+
+        if len(account_summaries) > 1:
+            print(sep)
+            print(f"Overall Summary({len(account_summaries)} accounts)")
+            print(sep)
+            print(summarize_all(account_summaries))
             print()
     elif not errors:
         print("\nNo new tweets found from any monitored account.")
