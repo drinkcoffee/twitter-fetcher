@@ -2,8 +2,8 @@
 """
 X (Twitter) Account Monitor — Nitter edition
 
-Fetches recent tweets from a list of accounts via Nitter (no API key needed),
-stores them locally, and prints a summary of new tweets since the last run.
+Fetches recent tweets from a list of accounts via Nitter (no API key needed)
+and prints a summary of tweets within the lookback window.
 """
 
 import json
@@ -20,9 +20,8 @@ from selenium import webdriver
 from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.remote.webdriver import WebDriver
 
-STORE_FILE = Path("tweet_store.json")
 ACCOUNTS_FILE = Path("accounts.json")
-MAX_RESULTS_FIRST_RUN = 20
+LOOKBACK_HOURS = 24  # Only report tweets from this many hours ago
 
 # Try instances in order; first one that responds wins
 NITTER_INSTANCES = [
@@ -31,26 +30,6 @@ NITTER_INSTANCES = [
     "https://nitter.cz",
     "https://nitter.net",
 ]
-
-
-
-# ---------------------------------------------------------------------------
-# Data persistence
-# ---------------------------------------------------------------------------
-
-def load_store() -> dict:
-    if STORE_FILE.exists():
-        with open(STORE_FILE) as f:
-            result = json.load(f)
-    else:
-        result = {"accounts": {}, "last_run": None}
-    return result
-
-
-def save_store(store: dict) -> None:
-    store["last_run"] = datetime.now(timezone.utc).isoformat()
-    with open(STORE_FILE, "w") as f:
-        json.dump(store, f, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -86,27 +65,23 @@ def pick_instance(driver: WebDriver) -> str | None:
             driver.get(base)
             html = driver.page_source
             if len(html) > 1000:
-                # print(f"[DEBUG] pick_instance() -> {base} ({len(html)} bytes)")
                 return base
             print(f" {base} returned too little content ({len(html)} bytes), skipping")
         except Exception as exc:
             print(f" {base} failed: {exc}")
-    print(f"No Nitter instances reachable)")
+    print("No Nitter instances reachable")
     return None
 
 
 def parse_tweet_id(tweet_link: str) -> str | None:
     """Extract numeric tweet ID from a path like /username/status/12345."""
-    #print(f"[DEBUG] parse_tweet_id('{tweet_link}')")
     parts = tweet_link.rstrip("/").split("/")
     if "status" in parts:
         idx = parts.index("status")
         if idx + 1 < len(parts):
             candidate = parts[idx + 1].split("#")[0]
             if candidate.isdigit():
-                #print(f"[DEBUG] parse_tweet_id() -> '{candidate}'")
                 return candidate
-    #print(f"[DEBUG] parse_tweet_id() -> None")
     return None
 
 
@@ -115,13 +90,10 @@ def parse_nitter_date(title: str) -> str:
     Nitter title attribute format: 'Mar 9, 2026 · 3:45 PM UTC'
     Returns ISO format string or the raw title if parsing fails.
     """
-    #print(f"[DEBUG] parse_nitter_date('{title}')")
     try:
         clean = title.replace(" · ", " ").replace(" UTC", "")
         dt = datetime.strptime(clean, "%b %d, %Y %I:%M %p")
-        result = dt.replace(tzinfo=timezone.utc).isoformat()
-        #print(f"[DEBUG] parse_nitter_date() -> '{result}'")
-        return result
+        return dt.replace(tzinfo=timezone.utc).isoformat()
     except ValueError:
         print(f"[DEBUG] parse_nitter_date() -> '{title}' (parse failed, returning raw)")
         return title
@@ -131,11 +103,10 @@ def fetch_tweets(
     driver: WebDriver,
     base_url: str,
     username: str,
-    since_id: str | None,
-    is_first_run: bool,
+    cutoff_dt: datetime,
 ) -> tuple[list[dict], str | None]:
     """
-    Scrape Nitter for tweets from `username`.
+    Scrape Nitter for tweets from `username` posted after `cutoff_dt`.
     Returns (tweets, error_message). tweets is sorted oldest-first.
     """
     url = f"{base_url}/{username}"
@@ -145,19 +116,16 @@ def fetch_tweets(
         if len(html) < 1000:
             return [], f"unexpected empty response ({len(html)} bytes)"
     except Exception as exc:
-        print(f"[DEBUG] fetch_tweets() -> ([], '{exc}')")
         return [], str(exc)
 
     soup = BeautifulSoup(html, "html.parser")
-    # Check for 404-style "user not found" page
     if soup.select_one(".error-panel"):
         return [], "user not found"
     items = soup.select(".timeline-item")
 
     tweets = []
     for item in items:
-        # Skip pinned tweets on subsequent runs to avoid re-reporting them
-        if item.select_one(".pinned") and not is_first_run:
+        if item.select_one(".pinned"):
             continue
 
         link_tag = item.select_one(".tweet-link")
@@ -171,22 +139,23 @@ def fetch_tweets(
         if not tweet_id:
             continue
 
-        # Filter to only show tweets newer than what we've seen
-        if since_id and int(tweet_id) <= int(since_id):
-            continue
-
         date_title = date_tag.get("title", "") if date_tag else ""
+        created_at = parse_nitter_date(date_title) if date_title else ""
+
+        if created_at:
+            try:
+                if datetime.fromisoformat(created_at) < cutoff_dt:
+                    continue
+            except ValueError:
+                pass
+
         tweets.append({
             "id": tweet_id,
             "text": content_tag.get_text(separator=" ", strip=True),
-            "created_at": parse_nitter_date(date_title) if date_title else "",
+            "created_at": created_at,
         })
 
-    # Oldest-first, and cap on first run
     tweets.sort(key=lambda t: int(t["id"]))
-    if is_first_run:
-        tweets = tweets[-MAX_RESULTS_FIRST_RUN:]
-
     return tweets, None
 
 
@@ -199,7 +168,6 @@ SYSTEM_PROMPT = "You summarize tweets concisely. Be direct and factual. 2-3 sent
 
 def summarize_tweets(username: str, tweets: list[dict]) -> str:
     """Return a concise AI-generated summary of what an account has been saying."""
-    #print(f"[DEBUG] summarize_tweets(username='{username}', tweets={len(tweets)} items)")
     tweet_text = "\n".join(
         f"- [{fmt_time(t['created_at'])}] {t['text']}" for t in tweets
     )
@@ -207,15 +175,8 @@ def summarize_tweets(username: str, tweets: list[dict]) -> str:
         f"Summarize what @{username} has been saying based on these recent tweets:\n\n"
         f"{tweet_text}"
     )
-
     provider = os.environ.get("LLM_PROVIDER", "ollama").lower()
-    if provider == "anthropic":
-        result = _summarize_anthropic(user_prompt)
-    else:
-        result = _summarize_ollama(user_prompt)
-
-    #print(f"[DEBUG] summarize_tweets() -> '{result[:100]}{'...' if len(result) > 100 else ''}'")
-    return result
+    return _summarize_anthropic(user_prompt) if provider == "anthropic" else _summarize_ollama(user_prompt)
 
 
 def _summarize_anthropic(user_prompt: str) -> str:
@@ -250,11 +211,7 @@ def summarize_all(account_summaries: list[tuple[str, str]]) -> str:
         f"Write a brief overall summary of the key themes and topics being discussed."
     )
     provider = os.environ.get("LLM_PROVIDER", "ollama").lower()
-    if provider == "anthropic":
-        result = _summarize_anthropic(user_prompt)
-    else:
-        result = _summarize_ollama(user_prompt)
-    return result
+    return _summarize_anthropic(user_prompt) if provider == "anthropic" else _summarize_ollama(user_prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -263,22 +220,12 @@ def summarize_all(account_summaries: list[tuple[str, str]]) -> str:
 
 def fmt_time(iso: str) -> str:
     if not iso:
-        print(f"[DEBUG] fmt_time() -> 'unknown time'")
         return "unknown time"
     try:
         dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        result = dt.strftime("%Y-%m-%d %H:%M UTC")
-        return result
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
     except ValueError:
-        print(f"[DEBUG] fmt_time() -> '{iso}' (parse failed, returning raw)")
         return iso
-
-
-def fmt_tweet(tweet: dict) -> str:
-    # print(f"[DEBUG] fmt_tweet(id={tweet.get('id')}, text='{tweet.get('text', '')[:50]}...')")
-    result = f"  [{fmt_time(tweet['created_at'])}] {tweet['text']}"
-    # print(f"[DEBUG] fmt_tweet() -> '{result[:80]}{'...' if len(result) > 80 else ''}'")
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -292,32 +239,18 @@ def main() -> None:
     print(f"Using LLM provider: {provider}" + (f" (model: {os.environ.get('OLLAMA_MODEL', 'llama3.2')})" if provider == "ollama" else ""))
 
     accounts = load_accounts()
-    store = load_store()
-    store.setdefault("accounts", {})
-
-    last_run: str | None = store.get("last_run")
-    is_first_run = last_run is None
-
-    if last_run is not None:
-        last_run_dt = datetime.fromisoformat(last_run)
-        now = datetime.now(timezone.utc)
-        if (now - last_run_dt).total_seconds() < 3600:
-            print("Last run was less than an hour ago — treating as if last run was one day ago.")
-            last_run = (now - timedelta(days=1)).isoformat()
-            # Clear per-account since_id so tweets from the past day are fetched
-            for key in store.get("accounts", {}):
-                store["accounts"][key].pop("last_tweet_id", None)
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
 
     options = Options()
     options.add_argument('-headless')
     driver = webdriver.Firefox(options=options)
     try:
-        _run(accounts, store, last_run, is_first_run, driver)
+        _run(accounts, cutoff_dt, driver)
     finally:
         driver.quit()
 
 
-def _run(accounts, store, last_run, is_first_run, driver: WebDriver) -> None:
+def _run(accounts: list[str], cutoff_dt: datetime, driver: WebDriver) -> None:
     print("Connecting to a Nitter instance...")
     base_url = pick_instance(driver)
     if not base_url:
@@ -329,60 +262,40 @@ def _run(accounts, store, last_run, is_first_run, driver: WebDriver) -> None:
     print(sep)
     print("X (Twitter) Monitor  [via Nitter]")
     print(f"Run at: {now_str}")
-    if last_run:
-        try:
-            last_dt = datetime.fromisoformat(last_run)
-            print(f"Last run: {last_dt.strftime('%Y-%m-%d %H:%M UTC')}")
-        except ValueError:
-            print(f"Last run: {last_run}")
-    else:
-        print("First run — fetching recent tweets as baseline")
+    print(f"Showing tweets from the last {LOOKBACK_HOURS} hour{'s' if LOOKBACK_HOURS != 1 else ''} (since {cutoff_dt.strftime('%Y-%m-%d %H:%M UTC')})")
     print(sep)
 
-    with_new: list[tuple[str, list[dict]]] = []
-    without_new: list[str] = []
+    with_tweets: list[tuple[str, list[dict]]] = []
+    without_tweets: list[str] = []
     errors: list[str] = []
 
     total = len(accounts)
     for i, username in enumerate(accounts, 1):
         print(f"[{i}/{total}] Checking @{username}...", end=" ", flush=True)
 
-        key = username.lower()
-        account_data = store["accounts"].get(key, {})
-        since_id = None if is_first_run else account_data.get("last_tweet_id")
-
-        tweets, error = fetch_tweets(driver, base_url, username, since_id, is_first_run)
+        tweets, error = fetch_tweets(driver, base_url, username, cutoff_dt)
 
         if error:
             print(f"error: {error}")
             errors.append(f"@{username}: {error}")
             continue
 
-        store["accounts"].setdefault(key, {})
-
         if tweets:
-            count = len(tweets)
-            print(f"{count} new tweet{'s' if count != 1 else ''}")
-            max_id = max(tweets, key=lambda t: int(t["id"]))["id"]
-            store["accounts"][key]["last_tweet_id"] = max_id
-            store["accounts"][key]["last_updated"] = datetime.now(timezone.utc).isoformat()
-            with_new.append((username, tweets))
+            print(f"{len(tweets)} tweet{'s' if len(tweets) != 1 else ''}")
+            with_tweets.append((username, tweets))
         else:
-            print("no new tweets")
-            without_new.append(username)
+            print("no tweets")
+            without_tweets.append(username)
 
         time.sleep(1)  # be polite to Nitter instances
 
-    save_store(store)
     print()
 
-    if with_new:
-        label = "Recent Tweets (first run)" if is_first_run else "New Tweets Since Last Run"
-        print(f"\n{label}\n")
+    if with_tweets:
+        print(f"\nTweets (last {LOOKBACK_HOURS}h)\n")
         account_summaries: list[tuple[str, str]] = []
-        for username, tweets in with_new:
-            count = len(tweets)
-            print(f"@{username}  ({count} new tweet{'s' if count != 1 else ''})")
+        for username, tweets in with_tweets:
+            print(f"@{username}  ({len(tweets)} tweet{'s' if len(tweets) != 1 else ''})")
             for tweet in tweets:
                 print(f"  {fmt_time(tweet['created_at'])}")
             summary = summarize_tweets(username, tweets)
@@ -392,22 +305,22 @@ def _run(accounts, store, last_run, is_first_run, driver: WebDriver) -> None:
 
         if len(account_summaries) > 1:
             print(sep)
-            print(f"Overall Summary({len(account_summaries)} accounts)")
+            print(f"Overall Summary ({len(account_summaries)} accounts)")
             print(sep)
             print(summarize_all(account_summaries))
             print()
     elif not errors:
-        print("\nNo new tweets found from any monitored account.")
+        print(f"\nNo tweets found from any monitored account in the last {LOOKBACK_HOURS}h.")
 
     if errors:
         print("\nErrors:")
         for msg in errors:
             print(f"  - {msg}")
 
-    if without_new:
+    if without_tweets:
         print("-" * 70)
-        print("No new tweets:")
-        for username in without_new:
+        print(f"No tweets in last {LOOKBACK_HOURS}h:")
+        for username in without_tweets:
             print(f"  @{username}")
 
     print(sep)
